@@ -34,7 +34,7 @@ The tool presents the results in a web-based interface with grouped, collapsible
 
 #### 1. Download & Extract
 Download the latest ZIP:  
-**[netskope_log_webapp_clean_tenant_final.zip](sandbox:/mnt/data/netskope_log_webapp_clean_tenant_final.zip)**
+**[Latest Release](https://github.com/duduke/netskope-client-log-parser/releases/tag/release)**
 
 Extract it to a folder of your choice.
 
