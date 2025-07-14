@@ -15,9 +15,30 @@
   <div class="alert alert-info">{{ log_type_message }}</div>
 
   <!-- Client & Host Metadata -->
-  <p><strong>Hostname:</strong> {{ hostname }}</p>
-  <p><strong>OS Version:</strong> {{ os_version }}</p>
-  <p><strong>Client Version:</strong> {{ client_version }}</p>
+  <p>
+    <strong>Hostname:</strong>
+    {% if hostname %}
+      {{ hostname }}
+    {% else %}
+      Information not found in log file. It may have rolled to an older log
+    {% endif %}
+  </p>
+  <p>
+    <strong>OS Version:</strong>
+    {% if os_version %}
+      {{ os_version }}
+    {% else %}
+      Information not found in log file. It may have rolled to an older log
+    {% endif %}
+  </p>
+  <p>
+    <strong>Client Version:</strong>
+    {% if client_version %}
+      {{ client_version }}
+    {% else %}
+      Information not found in log file. It may have rolled to an older log
+    {% endif %}
+  </p>
   {% if tenant %}
     <p><strong>Tenant:</strong> {{ tenant }}</p>
   {% endif %}
