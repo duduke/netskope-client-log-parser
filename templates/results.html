@@ -1,70 +1,156 @@
-
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Results</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <meta charset="utf-8">
+  <title>Parsed Netskope Log</title>
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  >
 </head>
 <body class="container py-4">
-    <h2>Parsed Netskope Log</h2>
+  <h2>Parsed Netskope Log</h2>
 
-    <p><strong>Hostname:</strong> {{ hostname }}</p>
-    <p><strong>OS Version:</strong> {{ os_version }}</p>
-    <p><strong>Client Version:</strong> {{ client_version }}</p>
-    {% if tenant %}<p><strong>Tenant:</strong> {{ tenant }}</p>{% endif %}
-    {% if last_gateway %}<p><strong>Last Connected Gateway:</strong> {{ last_gateway }}</p>{% endif %}
-    {% if steering_modes %}
-        <div class="card my-3">
-            <div class="card-header" data-bs-toggle="collapse" data-bs-target="#steering-modes">🔽 Traffic Steering Modes</div>
-            <div id="steering-modes" class="collapse"><div class="card-body"><pre>{{ steering_modes|join('\n') }}</pre></div></div>
-        </div>
-    {% endif %}
+  <!-- Log Type Banner -->
+  <div class="alert alert-info">{{ log_type_message }}</div>
 
-    <h4 class="mt-4">Last 5 PoP Connections</h4>
-    <ul>
-        {% for entry in pops %}
-        <li><code>{{ entry }}</code></li>
+  <!-- Client & Host Metadata -->
+  <p><strong>Hostname:</strong> {{ hostname }}</p>
+  <p><strong>OS Version:</strong> {{ os_version }}</p>
+  <p><strong>Client Version:</strong> {{ client_version }}</p>
+  {% if tenant %}
+    <p><strong>Tenant:</strong> {{ tenant }}</p>
+  {% endif %}
+  {% if last_gateway %}
+    <p><strong>Last Connected Gateway:</strong> {{ last_gateway }}</p>
+  {% endif %}
+
+  <!-- Steering Information -->
+  <h3 class="mt-4">Steering Information</h3>
+
+  <!-- RTT Measurements -->
+  <div class="card mb-2">
+    <div
+      class="card-header"
+      data-bs-toggle="collapse"
+      data-bs-target="#rtt-panel"
+      style="cursor: pointer;"
+    >
+      🔽 RTT Measurements
+    </div>
+    <div id="rtt-panel" class="collapse">
+      <div class="card-body">
+        {{ rtt_table|safe }}
+      </div>
+    </div>
+  </div>
+
+  <!-- Steering Messages -->
+  <div class="card mb-2">
+    <div
+      class="card-header"
+      data-bs-toggle="collapse"
+      data-bs-target="#steering-panel"
+      style="cursor: pointer;"
+    >
+      🔽 Steering Messages
+    </div>
+    <div id="steering-panel" class="collapse">
+      <ul class="list-group list-group-flush">
+        {% for line in steering_info %}
+          <li class="list-group-item"><code>{{ line }}</code></li>
         {% endfor %}
-    </ul>
-
-    <div class="card my-4">
-        <div class="card-header" data-bs-toggle="collapse" data-bs-target="#rtt-table">🔽 RTT to PoPs</div>
-        <div id="rtt-table" class="collapse"><div class="card-body">{{ rtt|safe }}</div></div>
+      </ul>
     </div>
+  </div>
 
-    <div class="card my-4">
-        <div class="card-header" data-bs-toggle="collapse" data-bs-target="#general-errors">🔽 General Errors & Warnings</div>
-        <div id="general-errors" class="collapse"><div class="card-body">{{ generalerr|safe }}</div></div>
+  <!-- Last 5 PoP Connections -->
+  <div class="card mb-4">
+    <div
+      class="card-header"
+      data-bs-toggle="collapse"
+      data-bs-target="#pops-panel"
+      style="cursor: pointer;"
+    >
+      🔽 Last 5 PoP Connections
     </div>
+    <div id="pops-panel" class="collapse">
+      <ul class="list-group list-group-flush">
+        {% for pop in pops %}
+          <li class="list-group-item"><code>{{ pop }}</code></li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
 
-    <h3 class="mt-4">Tunneled Processes ({{ tunneled_count }})</h3>
-    {% for process, hosts in grouped_tunneled.items() %}
-        <div class="card my-3">
-            <div class="card-header" data-bs-toggle="collapse" data-bs-target="#tun-{{ loop.index }}">🔽 {{ process }}</div>
-            <div id="tun-{{ loop.index }}" class="collapse">
-                <ul class="list-group list-group-flush">
-                {% for host, entries in hosts.items() %}
-                    <li class="list-group-item"><strong>{{ host }}</strong> ({{ entries|length }} connections)</li>
-                {% endfor %}
-                </ul>
-            </div>
-        </div>
-    {% endfor %}
+  <!-- Errors and Warnings -->
+  <h3>Errors and Warnings</h3>
+  <div class="card mb-4">
+    <div
+      class="card-header"
+      data-bs-toggle="collapse"
+      data-bs-target="#errors-panel"
+      style="cursor: pointer;"
+    >
+      🔽 Show/Hide Errors and Warnings
+    </div>
+    <div id="errors-panel" class="collapse">
+      <div class="card-body">
+        {{ error_table|safe }}
+      </div>
+    </div>
+  </div>
 
-    <h3 class="mt-4">Bypassed Processes ({{ bypassed_count }})</h3>
-    {% for process, hosts in grouped_bypassed.items() %}
-        <div class="card my-3">
-            <div class="card-header" data-bs-toggle="collapse" data-bs-target="#byp-{{ loop.index }}">🔽 {{ process }}</div>
-            <div id="byp-{{ loop.index }}" class="collapse">
-                <ul class="list-group list-group-flush">
-                {% for host, entries in hosts.items() %}
-                    <li class="list-group-item"><strong>{{ host }}</strong> ({{ entries|length }} connections)</li>
-                {% endfor %}
-                </ul>
-            </div>
-        </div>
-    {% endfor %}
+  <!-- Tunneled Traffic -->
+  <h3>Tunneled Processes ({{ tunneled_count }})</h3>
+  {% for process, hosts in grouped_tunneled.items() %}
+    <div class="card my-2">
+      <div
+        class="card-header"
+        data-bs-toggle="collapse"
+        data-bs-target="#tun-{{ loop.index }}"
+        style="cursor: pointer;"
+      >
+        🔽 {{ process }} ({{ hosts|length }} hosts)
+      </div>
+      <div id="tun-{{ loop.index }}" class="collapse">
+        <ul class="list-group list-group-flush">
+          {% for host, count in hosts.items() %}
+            <li class="list-group-item">
+              <strong>{{ host }}</strong> ({{ count }} connections)
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  {% endfor %}
 
+  <!-- Bypassed Traffic -->
+  <h3 class="mt-4">Bypassed Processes ({{ bypassed_count }})</h3>
+  {% for process, hosts in grouped_bypassed.items() %}
+    <div class="card my-2">
+      <div
+        class="card-header"
+        data-bs-toggle="collapse"
+        data-bs-target="#byp-{{ loop.index }}"
+        style="cursor: pointer;"
+      >
+        🔽 {{ process }} ({{ hosts|length }} hosts)
+      </div>
+      <div id="byp-{{ loop.index }}" class="collapse">
+        <ul class="list-group list-group-flush">
+          {% for host, count in hosts.items() %}
+            <li class="list-group-item">
+              <strong>{{ host }}</strong> ({{ count }} connections)
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  {% endfor %}
+
+  <script
+    src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"
+  ></script>
 </body>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </html>
