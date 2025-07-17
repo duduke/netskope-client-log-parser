@@ -1,222 +1,303 @@
 import re
-import pandas as pd
 from datetime import datetime, timedelta
+import pandas as pd
 
-# ── NSDEBUGLOG PARSING ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# NSDEBUGLOG PARSING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_log_lines(lines):
-    tunneled_records, bypassed_records = [], []
-    pop_entries, rtt_records = [], []
-    general_errors, steering_records = [], []
-    last_gateway = None
-    header_info = {"hostname":"", "os_version":"", "client_version":"", "tenant":""}
+    tunnel_records   = []
+    bypass_records   = []
+    pop_entries      = []
+    rtt_records      = []
+    error_records    = []
+    steering_records = []
+    last_gateway     = None
+    header_info      = {"hostname":None,"os_version":None,"client_version":None,"tenant":None}
 
-    for line in lines:
-        # Timestamp
-        m_ts = re.match(r'^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)', line)
-        if not m_ts:
-            continue
-        ts_str = m_ts.group(1)
-        try:
-            timestamp = datetime.strptime(ts_str, "%Y/%m/%d %H:%M:%S.%f")
-        except ValueError:
-            timestamp = datetime.strptime(ts_str, "%Y/%m/%d %H:%M:%S")
-
-        low = line.lower()
-
-        # Tunneled
-        if "tunneling flow" in low:
-            pm  = re.search(r'process:\s*(.*?)(?:,| to host:)', line)
-            hm  = re.search(r'host:\s*([^\s,]+)', line)
-            ipm = re.search(r'addr:\s*([^\s,]+)', line)
-            if pm and hm and ipm:
-                tunneled_records.append((
-                    timestamp,
-                    pm.group(1).strip(),
-                    hm.group(1).strip(),
-                    ipm.group(1).strip()
-                ))
-
-        # Bypassed
-        if "bypassappmgr" in low:
-            pm  = re.search(r'process:\s*([^,\n]+)', line, re.IGNORECASE)
-            hm  = re.search(r'(?:exception host|host):\s*([^\s,]+)', line, re.IGNORECASE)
-            ipm = re.search(r'dest ip:\s*([^\s,]+)', line, re.IGNORECASE)
-            if ipm:
-                bypassed_records.append((
-                    timestamp,
-                    pm.group(1).strip() if pm else "UNKNOWN",
-                    hm.group(1).strip() if hm else "",
-                    ipm.group(1).strip()
-                ))
-
-        # PoP connections
-        if "tunnel established to gateway" in low or "connecting to gateway-" in low:
-            pop_entries.append((timestamp, line.strip()))
-            if "connecting to gateway-" in low:
-                lg = re.search(r'connecting to (gateway-[^:\s]+)', line, re.IGNORECASE)
-                if lg:
-                    last_gateway = lg.group(1).strip()
-
-        # RTT
-        if "post client rtt" in low and "pop:" in low:
-            m_rtt = re.search(r'pop:([^\s]+)\s+ip:([^\s]+)\s+rtt:(\d+)', line)
-            if m_rtt:
-                rtt_records.append((
-                    timestamp,
-                    m_rtt.group(1),
-                    m_rtt.group(2),
-                    int(m_rtt.group(3))
-                ))
-
-        # Steering
-        if "dynamic steering enhancement" in low:
-            steering_records.append(line.strip())
-
-        # General errors/warnings
-        if " error " in low or " warn " in low or "err:" in low:
-            general_errors.append((timestamp, line.strip()))
-
-        # Header info
-        if "config setting sta user agent" in low:
-            m_hdr = re.search(r'STA user agent:\s*([^;]+);([^;]+);(.+)', line, re.IGNORECASE)
-            if m_hdr:
-                header_info["os_version"]     = m_hdr.group(1).strip()
-                header_info["client_version"] = m_hdr.group(2).strip()
-                header_info["hostname"]       = m_hdr.group(3).strip()
-
-        # Tenant
-        if "url:https://addon-" in low:
-            m_tnt = re.search(r'url:https://addon-([^\s/]+)', line, re.IGNORECASE)
-            if m_tnt:
-                header_info["tenant"] = m_tnt.group(1).strip()
-
-    return (
-        pd.DataFrame(tunneled_records, columns=["Timestamp","Process","Destination Host","Destination IP"]),
-        pd.DataFrame(bypassed_records, columns=["Timestamp","Process","Destination Host","Destination IP"]),
-        pop_entries,
-        pd.DataFrame(rtt_records,   columns=["Timestamp","PoP","IP","RTT (ms)"]),
-        pd.DataFrame(general_errors,columns=["Timestamp","Log Line"]),
-        steering_records,
-        last_gateway,
-        header_info
+    # precompile
+    re_ts      = re.compile(r'^(?P<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)')
+    re_steer   = re.compile(r'dynamic steering enhancement:', re.IGNORECASE)
+    re_pop     = re.compile(r'gateway:\s*([^,]+), pop:\s*([^,]+)', re.IGNORECASE)
+    re_rtt     = re.compile(r'post client rtt pop:([^ ]+)\s+ip:([^ ]+)\s+rtt:(\d+)', re.IGNORECASE)
+    re_error   = re.compile(r'(?:err|error|warn|warning):', re.IGNORECASE)
+    re_bypass  = re.compile(
+        r'bypassing flow to (?:exception host|host):\s*([^,]+),\s*'
+        r'process:\s*([^,]+),\s*Dest IP:\s*([^,]+)',
+        re.IGNORECASE
+    )
+    re_tunnel  = re.compile(
+        r'Tunneling flow from addr:[^,]+,\s*'
+        r'process:\s*(.*?)\s+to host:\s*([^,]+),\s*addr:\s*([^:,\s]+)',
+        re.IGNORECASE
+    )
+    re_header  = re.compile(
+        r'Config setting STA user agent:\s*(?P<os>.+?);\s*'
+        r'Netskope ST Agent\s*(?P<cv>[^;]+);(?P<host>.+)',
+        re.IGNORECASE
+    )
+    re_tenant  = re.compile(r'url:https://addon-(?P<tenant>[^ ]+)', re.IGNORECASE)
+    re_connect = re.compile(
+        r'nsTunnel DTLS Connecting to gateway-(?P<gw>[^:]+)\.goskope\.com',
+        re.IGNORECASE
     )
 
+    for raw in lines:
+        ln = raw.rstrip()
+        m_ts = re_ts.match(ln)
+        if not m_ts:
+            continue
+        ts = datetime.strptime(m_ts.group("ts"), "%Y/%m/%d %H:%M:%S.%f")
 
-def filter_by_minutes(df_t, df_b, pops, df_rtt, df_err, steering_records, minutes):
-    ts_list = []
-    for df in (df_t, df_b, df_err):
-        if not df.empty:
-            ts_list.append(df["Timestamp"].max())
-    if pops:
-        ts_list.append(max(ts for ts,_ in pops))
-    for ln in steering_records:
-        m = re.match(r'^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)', ln)
+        # Bypass
+        m = re_bypass.search(ln)
         if m:
-            try:
-                t = datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S.%f")
-            except ValueError:
-                t = datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
-            ts_list.append(t)
+            bypass_records.append({
+                "Timestamp": ts,
+                "Process": m.group(2).strip(),
+                "Destination Host": m.group(1).strip(),
+                "Destination IP": m.group(3).strip(),
+                "Raw": ln
+            })
+            continue
 
-    if not ts_list:
-        return df_t, df_b, [], df_rtt, df_err, []
+        # Tunnel
+        m = re_tunnel.search(ln)
+        if m:
+            tunnel_records.append({
+                "Timestamp": ts,
+                "Process": m.group(1).strip(),
+                "Destination Host": m.group(2).strip(),
+                "Destination IP": m.group(3).strip(),
+                "Raw": ln
+            })
+            continue
 
-    cutoff = max(ts_list) - timedelta(minutes=minutes)
-    df_t      = df_t[df_t["Timestamp"] >= cutoff]
-    df_b      = df_b[df_b["Timestamp"] >= cutoff]
-    df_err    = df_err[df_err["Timestamp"]    >= cutoff]
-    pops      = [(ts,l) for ts,l in pops if ts >= cutoff]
-    steering  = [ln for ln in steering_records if re.match(r'^(\d{4}/\d{2}/\d{2} ', ln)
-                 and datetime.strptime(re.match(r'^(\d{4}/\d{2}/\d{2} .*?)', ln).group(1),
-                                       "%Y/%m/%d %H:%M:%S.%f") >= cutoff]
-    return df_t, df_b, pops, df_rtt, df_err, steering
-
-
-# ── NPADEBUGLOG PARSING ────────────────────────────────────────────────────
-
-def parse_npa_log_lines(lines):
-    tenant_url      = None
-    rtt_records     = []
-    error_records   = []
-    warning_records = []
-    tunnel_events   = []
-    policy_records  = []
-
-    it = iter(lines)
-    for line in it:
-        # Timestamp
-        m_ts = re.search(r'^\[[^:]+:(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)', line)
-        ts = None
-        if m_ts:
-            try:
-                ts = datetime.strptime(m_ts.group(1), "%Y-%m-%d %H:%M:%S.%f")
-            except:
-                ts = None
-
-        low = line.lower()
-
-        # Tenant URL
-        if "set tenant url" in low:
-            m_t = re.search(r"Set tenant url\s+(\S+)", line, re.IGNORECASE)
-            if m_t:
-                tenant_url = m_t.group(1).strip()
+        # PoP
+        m = re_pop.search(ln)
+        if m:
+            pop_entries.append((ts, ln))
+            continue
 
         # RTT
-        if "ip =" in low and "pop =" in low and "rtt =" in low:
-            m_r = re.search(
-                r"IP\s*=\s*([^,]+),\s*POP\s*=\s*([^,]+),\s*RTT\s*=\s*(\d+)\s*ms",
-                line,
-            )
-            if m_r:
-                rtt_records.append((m_r.group(2), m_r.group(1), int(m_r.group(3))))
+        m = re_rtt.search(ln)
+        if m:
+            rtt_records.append({
+                "Timestamp": ts,
+                "Pop": m.group(1),
+                "IP": m.group(2),
+                "RTT": int(m.group(3)),
+                "Raw": ln
+            })
+            continue
+
+        # Steering
+        if re_steer.search(ln):
+            steering_records.append(ln)
+            continue
 
         # Errors & Warnings
-        if "[error]" in low:
-            error_records.append((ts, line.strip()))
-        elif "[warn]" in low or "[warning]" in low:
-            warning_records.append((ts, line.strip()))
+        if re_error.search(ln):
+            error_records.append({"Timestamp": ts, "Message": ln})
+            continue
 
-        # Tunnel events
-        if "npa client is connecting to" in low or "adding npa tunnel" in low:
-            tunnel_events.append(line.strip())
+        # Header
+        m = re_header.search(ln)
+        if m and not header_info["hostname"]:
+            header_info["os_version"]     = m.group("os").strip()
+            header_info["client_version"] = m.group("cv").strip()
+            header_info["hostname"]       = m.group("host").strip()
+            continue
 
-        # Policy Events
-        if "adding host rule" in low:
-            # hostname
-            m_h = re.match(r'^\[([^:]+):', line)
-            hostname = m_h.group(1) if m_h else ""
-            policy_name = app_name = app_details = publishers = ""
+        # Tenant
+        m = re_tenant.search(ln)
+        if m and not header_info["tenant"]:
+            header_info["tenant"] = m.group("tenant").strip()
+            continue
 
-            # next lines
-            for _ in range(5):
-                try:
-                    nxt = next(it).strip()
-                except StopIteration:
-                    break
+        # Last gateway
+        m = re_connect.search(ln)
+        if m:
+            last_gateway = m.group("gw").strip()
+            continue
 
-                if nxt.lower().startswith("policy name:"):
-                    policy_name = nxt.split("Policy Name:",1)[1].strip()
-                elif nxt.lower().startswith("app name:"):
-                    app_name = nxt.split("App Name:",1)[1].strip()
-                elif ";" in nxt:
-                    # actual details line (ports/IPs)
-                    app_details = nxt
-                elif nxt.lower().startswith("publishers:"):
-                    publishers = nxt.split("Publishers:",1)[1].strip()
-                    break
+    # Build DataFrames
+    df_tunnel = pd.DataFrame(tunnel_records)
+    df_bypass = pd.DataFrame(bypass_records)
+    df_rtt    = pd.DataFrame(rtt_records)
+    df_errs   = pd.DataFrame(error_records)
 
-            policy_records.append({
-                "Timestamp":   ts,
-                "Hostname":    hostname,
-                "Policy Name": policy_name,
-                "App Name":    app_name,
-                "App Details": app_details,
-                "Publishers":  publishers
-            })
+    return df_tunnel, df_bypass, pop_entries, df_rtt, df_errs, steering_records, last_gateway, header_info
 
-    df_rtt      = pd.DataFrame(rtt_records,     columns=["PoP","IP","RTT (ms)"])
-    df_errors   = pd.DataFrame(error_records,   columns=["Timestamp","Log Line"])
-    df_warnings = pd.DataFrame(warning_records, columns=["Timestamp","Log Line"])
 
-    return tenant_url, df_rtt, df_errors, df_warnings, tunnel_events, policy_records
+def filter_ns_by_minutes(df_tun, df_byp, pops, df_rtt, df_errs, steer, minutes):
+    """
+    Keep only entries in the LAST `minutes` minutes **of the log**.
+    Uses the max Timestamp across all records as 'now'.
+    """
+    # collect all timestamps
+    all_ts = []
+    for df in (df_tun, df_byp, df_rtt, df_errs):
+        if "Timestamp" in df.columns and not df.empty:
+            all_ts.append(df["Timestamp"].max())
+    if pops:
+        all_ts.append(max(ts for ts,_ in pops))
+    if steer:
+        # steering lines begin with "YYYY/MM/DD HH:MM:SS.fff"
+        for ln in steer:
+            try:
+                all_ts.append(datetime.strptime(ln[:23], "%Y/%m/%d %H:%M:%S.%f"))
+            except:
+                pass
+
+    if not all_ts:
+        # nothing to filter
+        return df_tun, df_byp, pops, df_rtt, df_errs, steer
+
+    reference = max(all_ts)
+    cutoff    = reference - timedelta(minutes=minutes)
+
+    # filter each
+    df_tun = df_tun[df_tun["Timestamp"] >= cutoff] if "Timestamp" in df_tun.columns else df_tun
+    df_byp = df_byp[df_byp["Timestamp"] >= cutoff] if "Timestamp" in df_byp.columns else df_byp
+    pops   = [(ts,ln) for ts,ln in pops if ts >= cutoff]
+    df_rtt = df_rtt[df_rtt["Timestamp"] >= cutoff] if "Timestamp" in df_rtt.columns else df_rtt
+    df_errs= df_errs[df_errs["Timestamp"] >= cutoff] if "Timestamp" in df_errs.columns else df_errs
+
+    filtered_steer = []
+    for ln in steer:
+        try:
+            ts = datetime.strptime(ln[:23], "%Y/%m/%d %H:%M:%S.%f")
+            if ts >= cutoff:
+                filtered_steer.append(ln)
+        except:
+            filtered_steer.append(ln)
+    return df_tun, df_byp, pops, df_rtt, df_errs, filtered_steer
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NPADEBUGLOG PARSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_npa_log_lines(lines):
+    tenant_url    = None
+    rtt_events    = []
+    errs          = []
+    warns         = []
+    tunnel_events = []
+    policies      = []
+
+    prefix_re = re.compile(
+        r'^\[(?P<host>[^:]+):'
+        r'(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) [+\-]\d{2}:\d{2}\]\s*'
+    )
+    re_tenant = re.compile(r'[sS]et tenant url\s+(?P<tenant>\S+)\.?')
+    re_err    = re.compile(r'\[(?:err|error)\]\s*(?P<msg>.+)', re.IGNORECASE)
+    re_warn   = re.compile(r'\[(?:warn|warning)\]\s*(?P<msg>.+)', re.IGNORECASE)
+    re_tun    = re.compile(r'Tunneling flow', re.IGNORECASE)
+    re_pol    = re.compile(
+        r'policy\.cpp:\d+:buildImpl\(\):.*Adding Host Rule',
+        re.IGNORECASE
+    )
+
+    collecting = False
+    current    = {}
+
+    for raw in lines:
+        m = prefix_re.match(raw)
+        if m:
+            host = m.group("host")
+            ts   = datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S.%f")
+            rest = raw[m.end():].strip()
+        else:
+            host, ts, rest = None, None, raw.strip()
+
+        if tenant_url is None:
+            m2 = re_tenant.search(rest)
+            if m2:
+                tenant_url = m2.group("tenant")
+
+        m2 = re_err.search(raw)
+        if m2:
+            errs.append({"Timestamp": ts, "Message": raw.strip()})
+        m2 = re_warn.search(raw)
+        if m2:
+            warns.append({"Timestamp": ts, "Message": raw.strip()})
+
+        if "RTT" in rest and "HIST" not in rest:
+            rtt_events.append(rest)
+        if re_tun.search(rest):
+            tunnel_events.append(rest)
+
+        if re_pol.search(rest):
+            collecting = True
+            current = {"Hostname": host, "Timestamp": ts, "Publishers": None}
+            continue
+
+        if collecting:
+            if rest.startswith("Policy Name:"):
+                current["Policy Name"] = rest.split(":",1)[1].strip()
+            elif rest.startswith("App Name:"):
+                current["App Name"] = rest.split(":",1)[1].strip()
+            elif rest and rest[0].isdigit():
+                current["App Details"] = rest
+            elif rest.startswith("Publishers:"):
+                current["Publishers"] = rest.split(":",1)[1].strip()
+                policies.append(current)
+                collecting = False
+            continue
+
+    df_err  = pd.DataFrame(errs)
+    df_warn = pd.DataFrame(warns)
+    return tenant_url, rtt_events, df_err, df_warn, tunnel_events, policies
+
+
+def filter_npa_by_minutes(tenant_url, rtt_events, df_err, df_warn,
+                          tunnel_events, policy_records, minutes):
+    """
+    Filter npadebuglog entries to only the last `minutes` minutes of the log.
+    """
+    # collect all ts from err/warn and prefix
+    all_ts = []
+    for df in (df_err,):
+        if "Timestamp" in df.columns and not df.empty:
+            all_ts.append(df["Timestamp"].max())
+    # prefix-based for rtt_events and tunnel_events
+    for lst in (rtt_events, tunnel_events):
+        for ln in lst:
+            m = re.match(r'^\[.*:(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)', ln)
+            if m:
+                all_ts.append(datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S.%f"))
+    # policy_records ts
+    for p in policy_records:
+        if p.get("Timestamp"):
+            all_ts.append(p["Timestamp"])
+
+    if not all_ts:
+        return tenant_url, rtt_events, pd.concat([df_err, df_warn],ignore_index=True), tunnel_events, policy_records
+
+    reference = max(all_ts)
+    cutoff    = reference - timedelta(minutes=minutes)
+
+    # filter
+    filtered_rtt = []
+    for ln in rtt_events:
+        m = re.match(r'^\[.*:(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)', ln)
+        if m and datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S.%f") < cutoff:
+            continue
+        filtered_rtt.append(ln)
+
+    df_all = pd.concat([df_err, df_warn], ignore_index=True)
+    if "Timestamp" in df_all.columns:
+        df_all = df_all[df_all["Timestamp"] >= cutoff]
+
+    filtered_tun = []
+    for ln in tunnel_events:
+        m = re.match(r'^\[.*:(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)', ln)
+        if m and datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S.%f") < cutoff:
+            continue
+        filtered_tun.append(ln)
+
+    filtered_pols = [p for p in policy_records if p.get("Timestamp") and p["Timestamp"] >= cutoff]
+
+    return tenant_url, filtered_rtt, df_all, filtered_tun, filtered_pols

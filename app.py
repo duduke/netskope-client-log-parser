@@ -2,14 +2,15 @@ import os
 import tempfile
 import io
 import zipfile
-from flask import Flask, request, render_template, send_file, url_for
-import pandas as pd
+from flask import Flask, request, render_template, send_file
 from collections import defaultdict
+import pandas as pd
 
 from parser_utils import (
     parse_log_lines,
-    filter_by_minutes,
     parse_npa_log_lines,
+    filter_ns_by_minutes,
+    filter_npa_by_minutes,
 )
 
 app = Flask(__name__)
@@ -18,10 +19,11 @@ UPLOAD_FOLDER = tempfile.gettempdir()
 
 def group_by_process_and_host(df: pd.DataFrame):
     grouped = defaultdict(lambda: defaultdict(int))
-    for _, row in df.iterrows():
-        proc = row["Process"]
-        host = row["Destination Host"]
-        grouped[proc][host] += 1
+    if "Process" in df.columns and "Destination Host" in df.columns:
+        for _, row in df.iterrows():
+            proc = row["Process"]
+            host = row["Destination Host"]
+            grouped[proc][host] += 1
     return grouped
 
 
@@ -30,99 +32,103 @@ def index():
     if request.method == "GET":
         return render_template("index.html")
 
-    file = request.files.get("logfile")
-    if not file or file.filename == "":
-        return render_template("index.html", log_type_message="No file uploaded!")
+    upload = request.files.get("logfile")
+    if not upload or not upload.filename:
+        return render_template("index.html", error="No file uploaded!")
 
-    filename = file.filename
-    fn_lower = filename.lower()
+    fn = upload.filename.lower()
     minutes = request.form.get("minutes")
     minutes = int(minutes) if minutes and minutes.isdigit() else None
 
-    # Save uploaded file
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
-    with open(filepath, "r", errors="ignore") as fh:
+    # Save + read
+    path = os.path.join(UPLOAD_FOLDER, upload.filename)
+    upload.save(path)
+    with open(path, "r", errors="ignore") as fh:
         lines = fh.readlines()
 
-    # ── NSDEBUGLOG ──────────────────────────────────────────────────────────
-    if "nsdebuglog" in fn_lower:
-        log_type_message = "nsdebuglog log file detected!"
+    # Content sniffing
+    is_npa = any("policy.cpp" in ln for ln in lines)
+    is_ns  = any("stAgentSvc" in ln or "stAgentNE" in ln for ln in lines)
 
-        df_tunnel, df_bypass, pop_entries, df_rtt, df_errors, steering_records, last_gateway, header_info = parse_log_lines(lines)
-
+    # -- NSDEBUGLOG branch --
+    if "nsdebuglog" in fn or (is_ns and not is_npa):
+        msg = "nsdebuglog log file detected!"
+        df_t, df_b, pops, df_r, df_e, steer, last_gw, hdr = parse_log_lines(lines)
         if minutes is not None:
-            df_tunnel, df_bypass, pop_entries, df_rtt, df_errors, steering_records = filter_by_minutes(
-                df_tunnel, df_bypass, pop_entries, df_rtt, df_errors, steering_records, minutes
+            df_t, df_b, pops, df_r, df_e, steer = filter_ns_by_minutes(
+                df_t, df_b, pops, df_r, df_e, steer, minutes
             )
-
-        grouped_tunneled = group_by_process_and_host(df_tunnel)
-        grouped_bypassed = group_by_process_and_host(df_bypass)
-
-        # Dashboard stats
+        grouped_t = group_by_process_and_host(df_t)
+        grouped_b = group_by_process_and_host(df_b)
         stats = {
             "Log": "NS Debug",
-            "Time Span (min)": minutes if minutes is not None else "All",
-            "Errors": len(df_errors),
-            "Tunnels": len(df_tunnel),
-            "Bypasses": len(df_bypass),
+            "Span (min)": minutes or "All",
+            "Errors": len(df_e),
+            "Tunnels": len(df_t),
+            "Bypasses": len(df_b),
         }
 
-        # Write CSVs
-        df_tunnel.to_csv(os.path.join(UPLOAD_FOLDER, "tunneled.csv"), index=False)
-        df_bypass.to_csv(os.path.join(UPLOAD_FOLDER, "bypassed.csv"), index=False)
-        df_rtt.to_csv(os.path.join(UPLOAD_FOLDER, "rtt.csv"), index=False)
-        df_errors.to_csv(os.path.join(UPLOAD_FOLDER, "general_errors.csv"), index=False)
+        # Save CSVs
+        df_t.to_csv(os.path.join(UPLOAD_FOLDER, "tunneled.csv"), index=False)
+        df_b.to_csv(os.path.join(UPLOAD_FOLDER, "bypassed.csv"), index=False)
+        df_r.to_csv(os.path.join(UPLOAD_FOLDER, "rtt.csv"), index=False)
+        df_e.to_csv(os.path.join(UPLOAD_FOLDER, "general_errors.csv"), index=False)
 
         return render_template(
             "results.html",
-            log_type_message=log_type_message,
+            log_type_message=msg,
             stats=stats,
-            header=header_info,
-            last_gateway=last_gateway or "",
-            pops=[line for _, line in pop_entries[-5:]] if pop_entries else [],
-            df_rtt=df_rtt.to_html(classes="table table-sm", index=False),
-            df_err=df_errors.to_html(classes="table table-sm", index=False),
-            steering=steering_records,
-            tunneled=grouped_tunneled,
-            bypassed=grouped_bypassed,
+            header=hdr,
+            last_gateway=last_gw or "",
+            pops=[ln for _, ln in pops[-5:]] if pops else [],
+            df_rtt=df_r.to_html(classes="table table-sm", index=False),
+            df_err=df_e.to_html(classes="table table-sm", index=False),
+            steering=steer,
+            tunneled=grouped_t,
+            bypassed=grouped_b,
         )
 
-    # ── NPADEBUGLOG ─────────────────────────────────────────────────────────
-    elif "npadebuglog" in fn_lower:
-        log_type_message = "npadebuglog log file detected!"
+    # -- NPADEBUGLOG branch --
+    if "npadebuglog" in fn or is_npa:
+        msg = "npadebuglog log file detected!"
+        tenant, rtt_events, df_err, df_warn, tunnels, policies = parse_npa_log_lines(lines)
 
-        tenant_url, df_rtt_npa, df_err_npa, df_warn_npa, tunnel_events, policy_records = parse_npa_log_lines(lines)
+        if minutes is not None:
+            tenant, rtt_events, df_all_errs, tunnels, policies = filter_npa_by_minutes(
+                tenant, rtt_events, df_err, df_warn, tunnels, policies, minutes
+            )
+        else:
+            df_all_errs = pd.concat([df_err, df_warn], ignore_index=True)
 
-        # Combine errors + warnings
-        df_err_warn = pd.concat([df_err_npa, df_warn_npa]).sort_values("Timestamp")
-
-        # Dashboard stats
         stats = {
             "Log": "NPA Debug",
-            "Errors": len(df_err_warn),
-            "Tunnels": len(tunnel_events),
-            "Apps": len(policy_records),
+            "Errors": len(df_all_errs),
+            "Tunnels": len(tunnels),
+            "Apps": len(policies),
         }
 
-        # Write CSVs
-        df_rtt_npa.to_csv(os.path.join(UPLOAD_FOLDER, "npa_rtt.csv"), index=False)
-        df_err_warn.to_csv(os.path.join(UPLOAD_FOLDER, "npa_errors.csv"), index=False)
+        # Save CSVs
+        pd.DataFrame(rtt_events, columns=["Event"]).to_csv(
+            os.path.join(UPLOAD_FOLDER, "npa_rtt.csv"), index=False
+        )
+        df_all_errs.to_csv(os.path.join(UPLOAD_FOLDER, "npa_errors.csv"), index=False)
 
         return render_template(
             "npa_results.html",
-            log_type_message=log_type_message,
+            log_type_message=msg,
             stats=stats,
-            tenant_url=tenant_url,
-            df_rtt_npa=df_rtt_npa.to_html(classes="table table-sm", index=False),
-            error_table=df_err_warn.to_html(classes="table table-sm", index=False),
-            tunnel_events=tunnel_events,
-            policy_records=policy_records,
+            tenant_url=tenant or "",
+            rtt_events=rtt_events,
+            error_table=df_all_errs.to_html(classes="table table-sm", index=False),
+            tunnel_events=tunnels,
+            policy_records=policies,
         )
 
-    # ── INVALID LOG TYPE ────────────────────────────────────────────────────
-    else:
-        return render_template("index.html", log_type_message="invalid log file detected!")
+    # -- Fallback --
+    return render_template(
+        "index.html",
+        error="Could not detect log type—please upload a valid nsdebuglog or npadebuglog file."
+    )
 
 
 @app.route("/download/<datatype>")
@@ -148,22 +154,21 @@ def download(datatype):
 def export_all():
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w") as z:
-        for fname in (
+        for name in (
             "tunneled.csv", "bypassed.csv", "rtt.csv", "general_errors.csv",
             "npa_rtt.csv", "npa_errors.csv"
         ):
-            path = os.path.join(UPLOAD_FOLDER, fname)
-            if os.path.exists(path):
-                z.write(path, arcname=fname)
+            p = os.path.join(UPLOAD_FOLDER, name)
+            if os.path.exists(p):
+                z.write(p, arcname=name)
     mem.seek(0)
     return send_file(
         mem,
-        download_name="all_logs_export.zip",
+        download_name="all_logs.zip",
         as_attachment=True,
-        mimetype="application/zip",
+        mimetype="application/zip"
     )
 
 
 if __name__ == "__main__":
-    # listen on all interfaces
     app.run(host="0.0.0.0", port=5000, debug=True)
